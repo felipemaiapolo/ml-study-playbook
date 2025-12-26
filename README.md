@@ -1,741 +1,799 @@
-# PyTorch Applied ML — Study Repo Cheat Sheet
+# PyTorch Cheat Sheet (copy/paste friendly)
 
-A practical, copy-pasteable set of **PyTorch patterns** for solving “given a dataset → build a model → train → evaluate → iterate” problems fast.
+This is a practical “grab blocks and ship” guide. It’s opinionated: it favors patterns that don’t surprise you and don’t silently do the wrong thing.
 
 ---
 
-## Environment quickstart
+## Contents
+- [0. Setup + imports](#0-setup--imports)
+- [1. Reproducibility](#1-reproducibility)
+- [2. Device, dtype, and performance knobs](#2-device-dtype-and-performance-knobs)
+- [3. Datasets + DataLoaders](#3-datasets--dataloaders)
+- [4. Models](#4-models)
+- [5. Losses](#5-losses)
+- [6. Metrics + meters](#6-metrics--meters)
+- [7. Optimizers + schedulers](#7-optimizers--schedulers)
+- [8. Training loop (AMP, grad clip, accumulation)](#8-training-loop-amp-grad-clip-accumulation)
+- [9. Evaluation + inference](#9-evaluation--inference)
+- [10. Checkpointing + resume](#10-checkpointing--resume)
+- [11. Early stopping](#11-early-stopping)
+- [12. Debug playbook](#12-debug-playbook)
+- [13. Common shape conventions](#13-common-shape-conventions)
 
-### `requirements.txt` (minimal)
+---
+
+## 0. Setup + imports
+
+### requirements (minimal)
 ```txt
 torch
-torchvision
 numpy
-pandas
-scikit-learn
-tqdm
 ````
 
-### Reproducibility seed
+### imports
 
 ```python
-# src/utils/seed.py
 import os
-import random
+import math
+import time
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, Tuple, List
+
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+```
 
+---
+
+## 1. Reproducibility
+
+If you care about repeatability, you must seed *and* tame CUDA nondeterminism (with a speed hit).
+
+```python
 def seed_everything(seed: int = 42, deterministic: bool = False) -> None:
-  random.seed(seed)
+  os.environ["PYTHONHASHSEED"] = str(seed)
   np.random.seed(seed)
   torch.manual_seed(seed)
   torch.cuda.manual_seed_all(seed)
-  os.environ["PYTHONHASHSEED"] = str(seed)
 
   if deterministic:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+  else:
+    torch.backends.cudnn.benchmark = True
 ```
 
 ---
 
-## Core training skeleton (most common use)
-
-This is the fastest “works everywhere” template: **AMP**, **grad clipping**, **logging**, **early stopping**, **checkpoint best**.
+## 2. Device, dtype, and performance knobs
 
 ```python
-# src/train.py
-import math
-from dataclasses import dataclass
-from pathlib import Path
+def get_device() -> torch.device:
+  return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from tqdm import tqdm
+device = get_device()
+print("device:", device)
+```
 
-from utils.seed import seed_everything
-from utils.checkpoint import save_checkpoint, load_checkpoint
-from utils.meters import AverageMeter
+### Fast(er) host->GPU transfers
 
-@dataclass
-class TrainConfig:
-  seed: int = 42
-  device: str = "cuda"
-  epochs: int = 10
-  batch_size: int = 256
-  lr: float = 3e-4
-  weight_decay: float = 1e-2
-  grad_clip: float = 1.0
-  amp: bool = True
-  num_workers: int = 4
-  ckpt_dir: str = "checkpoints"
-  early_stop_patience: int = 5
+Use `pin_memory=True` in DataLoader and `non_blocking=True` when moving tensors.
 
-def train_one_epoch(model, loader, optimizer, scaler, loss_fn, device):
-  model.train()
-  loss_meter = AverageMeter()
+```python
+def to_device(batch: Any, device: torch.device) -> Any:
+  if torch.is_tensor(batch):
+    return batch.to(device, non_blocking=True)
+  if isinstance(batch, dict):
+    return {k: to_device(v, device) for k, v in batch.items()}
+  if isinstance(batch, (list, tuple)):
+    t = [to_device(x, device) for x in batch]
+    return type(batch)(t)
+  return batch
+```
 
-  pbar = tqdm(loader, desc="train", leave=False)
-  for batch in pbar:
-    x, y = batch
-    x = x.to(device, non_blocking=True)
-    y = y.to(device, non_blocking=True)
+### (Optional) torch.compile
 
-    optimizer.zero_grad(set_to_none=True)
+Worth trying for stable models; if it breaks, disable it.
 
-    with torch.autocast(device_type=device.split(":")[0], enabled=scaler is not None):
-      logits = model(x)
-      loss = loss_fn(logits, y)
-
-    if scaler is not None:
-      scaler.scale(loss).backward()
-      scaler.unscale_(optimizer)
-      torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-      scaler.step(optimizer)
-      scaler.update()
-    else:
-      loss.backward()
-      torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-      optimizer.step()
-
-    loss_meter.update(loss.item(), n=x.size(0))
-    pbar.set_postfix(loss=f"{loss_meter.avg:.4f}")
-
-  return {"loss": loss_meter.avg}
-
-@torch.no_grad()
-def evaluate(model, loader, loss_fn, device, metric_fn=None):
-  model.eval()
-  loss_meter = AverageMeter()
-  metric_meter = AverageMeter()
-
-  for batch in tqdm(loader, desc="eval", leave=False):
-    x, y = batch
-    x = x.to(device, non_blocking=True)
-    y = y.to(device, non_blocking=True)
-
-    logits = model(x)
-    loss = loss_fn(logits, y)
-    loss_meter.update(loss.item(), n=x.size(0))
-
-    if metric_fn is not None:
-      m = metric_fn(logits, y)
-      metric_meter.update(float(m), n=x.size(0))
-
-  out = {"loss": loss_meter.avg}
-  if metric_fn is not None:
-    out["metric"] = metric_meter.avg
-  return out
-
-def main():
-  cfg = TrainConfig()
-  seed_everything(cfg.seed)
-
-  device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
-  Path(cfg.ckpt_dir).mkdir(parents=True, exist_ok=True)
-
-  # TODO: plug your dataset/model
-  from data.datasets import ToyDataset
-  from models.mlp import MLP
-
-  train_ds = ToyDataset(split="train")
-  val_ds = ToyDataset(split="val")
-
-  train_loader = DataLoader(
-    train_ds,
-    batch_size=cfg.batch_size,
-    shuffle=True,
-    num_workers=cfg.num_workers,
-    pin_memory=True,
-    drop_last=True,
-  )
-  val_loader = DataLoader(
-    val_ds,
-    batch_size=cfg.batch_size,
-    shuffle=False,
-    num_workers=cfg.num_workers,
-    pin_memory=True,
-  )
-
-  model = MLP(in_dim=train_ds.in_dim, hidden=[256, 256], out_dim=train_ds.out_dim).to(device)
-
-  # Choose loss + metric per task (see sections below)
-  loss_fn = nn.CrossEntropyLoss()
-  metric_fn = accuracy
-
-  optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-  scaler = torch.cuda.amp.GradScaler(enabled=(cfg.amp and device.type == "cuda"))
-
-  best = -math.inf
-  bad_epochs = 0
-
-  for epoch in range(cfg.epochs):
-    tr = train_one_epoch(model, train_loader, optimizer, scaler, loss_fn, device)
-    va = evaluate(model, val_loader, loss_fn, device, metric_fn=metric_fn)
-
-    score = va.get("metric", -va["loss"])  # higher is better
-    print(f"epoch {epoch:03d} | train loss {tr['loss']:.4f} | val {va}")
-
-    is_best = score > best
-    if is_best:
-      best = score
-      bad_epochs = 0
-    else:
-      bad_epochs += 1
-
-    save_checkpoint(
-      {
-        "epoch": epoch,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict() if scaler is not None else None,
-        "best": best,
-      },
-      Path(cfg.ckpt_dir) / ("best.pt" if is_best else "last.pt")
-    )
-
-    if bad_epochs >= cfg.early_stop_patience:
-      print("Early stopping.")
-      break
-
-def accuracy(logits, y):
-  preds = logits.argmax(dim=-1)
-  return (preds == y).float().mean()
-
-if __name__ == "__main__":
-  main()
+```python
+def maybe_compile(model: nn.Module, enable: bool = False) -> nn.Module:
+  if enable and hasattr(torch, "compile"):
+    return torch.compile(model)
+  return model
 ```
 
 ---
 
-## Checkpoint utilities (safe + simple)
+## 3. Datasets + DataLoaders
+
+### 3.1 Map-style Dataset (most common)
+
+You return one sample at a time.
 
 ```python
-# src/utils/checkpoint.py
-import torch
+class NumpyDataset(Dataset):
+  def __init__(self, X: np.ndarray, y: Optional[np.ndarray] = None):
+    self.X = X.astype(np.float32)
+    self.y = None if y is None else y.astype(np.float32)
 
-def save_checkpoint(state: dict, path) -> None:
-  torch.save(state, path)
-
-def load_checkpoint(path, map_location="cpu") -> dict:
-  return torch.load(path, map_location=map_location)
-```
-
----
-
-## Dataset + DataLoader patterns
-
-### 1) Tabular dataset from CSV (classification or regression)
-
-```python
-# src/data/datasets.py
-from dataclasses import dataclass
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
-import torch
-from torch.utils.data import Dataset
-
-@dataclass
-class TabularSpec:
-  feature_cols: list[str]
-  target_col: str
-  task: str  # "clf" or "reg"
-
-class CSVDataset(Dataset):
-  def __init__(self, csv_path: str, spec: TabularSpec):
-    df = pd.read_csv(csv_path)
-
-    X = df[spec.feature_cols].to_numpy(dtype=np.float32)
-    y = df[spec.target_col].to_numpy()
-
-    if spec.task == "clf":
-      y = y.astype(np.int64)
-    else:
-      y = y.astype(np.float32)
-
-    self.X = torch.from_numpy(X)
-    self.y = torch.from_numpy(y)
-
-    self.in_dim = self.X.shape[1]
-    self.out_dim = int(np.max(y) + 1) if spec.task == "clf" else 1
-    self.task = spec.task
-
-  def __len__(self):
+  def __len__(self) -> int:
     return self.X.shape[0]
 
-  def __getitem__(self, idx):
-    x = self.X[idx]
-    y = self.y[idx]
-    if self.task == "reg":
-      y = y.view(1)
-    return x, y
+  def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    x = torch.from_numpy(self.X[idx])
+    if self.y is None:
+      return {"x": x}
+    y = torch.from_numpy(self.y[idx])
+    return {"x": x, "y": y}
 ```
 
-### 2) Image dataset (folder or custom)
+### 3.2 Custom collate_fn (variable length)
 
-Use `torchvision.datasets.ImageFolder` whenever possible.
-
-```python
-from torchvision import datasets, transforms
-
-tfm = transforms.Compose([
-  transforms.Resize((224, 224)),
-  transforms.ToTensor(),
-])
-
-train_ds = datasets.ImageFolder("data/train", transform=tfm)
-val_ds = datasets.ImageFolder("data/val", transform=tfm)
-```
-
-### 3) Variable-length sequences + padding collate
+Use when samples have different sizes (text sequences, variable #boxes, etc.).
 
 ```python
-# src/data/collate.py
-import torch
-
-def pad_collate(batch, pad_value: int = 0):
-  # batch: list[(seq_tensor[L], label)]
-  xs, ys = zip(*batch)
-  lengths = torch.tensor([x.size(0) for x in xs], dtype=torch.long)
+def pad_1d(seqs: List[torch.Tensor], pad_value: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+  lengths = torch.tensor([s.numel() for s in seqs], dtype=torch.long)
   max_len = int(lengths.max().item())
+  out = seqs[0].new_full((len(seqs), max_len), fill_value=pad_value)
+  for i, s in enumerate(seqs):
+    out[i, :s.numel()] = s
+  return out, lengths
 
-  x_padded = []
-  for x in xs:
-    pad_len = max_len - x.size(0)
-    if pad_len > 0:
-      x = torch.cat([x, x.new_full((pad_len, *x.shape[1:]), pad_value)], dim=0)
-    x_padded.append(x)
+def collate_text(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+  x_list = [b["x"] for b in batch]  # each x is (L,)
+  y = torch.stack([b["y"] for b in batch]) if "y" in batch[0] else None
+  x, lengths = pad_1d(x_list, pad_value=0)
+  out = {"x": x, "lengths": lengths}
+  if y is not None:
+    out["y"] = y
+  return out
+```
 
-  x_padded = torch.stack(x_padded, dim=0)  # [B, T, ...]
-  y = torch.tensor(ys)
-  return x_padded, y, lengths
+### 3.3 DataLoader template
+
+```python
+def make_loader(
+  ds: Dataset,
+  batch_size: int,
+  shuffle: bool,
+  num_workers: int = 4,
+  collate_fn=None
+) -> DataLoader:
+  return DataLoader(
+    ds,
+    batch_size=batch_size,
+    shuffle=shuffle,
+    num_workers=num_workers,
+    pin_memory=True,
+    persistent_workers=(num_workers > 0),
+    drop_last=shuffle,
+    collate_fn=collate_fn
+  )
 ```
 
 ---
 
-## Model templates you can adapt quickly
+## 4. Models
 
-### MLP (tabular baseline)
+### 4.1 MLP (tabular / embeddings already handled)
 
 ```python
-# src/models/mlp.py
-import torch
-import torch.nn as nn
-
 class MLP(nn.Module):
-  def __init__(self, in_dim: int, hidden: list[int], out_dim: int, dropout: float = 0.0):
+  def __init__(self, in_dim: int, hidden: List[int], out_dim: int, p_drop: float = 0.0):
     super().__init__()
     layers = []
-    d = in_dim
+    prev = in_dim
     for h in hidden:
       layers += [
-        nn.Linear(d, h),
-        nn.ReLU(),
-        nn.Dropout(dropout),
+        nn.Linear(prev, h),
+        nn.ReLU(inplace=True),
+        nn.Dropout(p_drop)
       ]
-      d = h
-    layers.append(nn.Linear(d, out_dim))
+      prev = h
+    layers.append(nn.Linear(prev, out_dim))
     self.net = nn.Sequential(*layers)
 
-  def forward(self, x):
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
     return self.net(x)
 ```
 
-### Simple CNN (images baseline)
+### 4.2 CNN for images (N, C, H, W)
 
 ```python
-# src/models/cnn.py
-import torch.nn as nn
-
 class SmallCNN(nn.Module):
-  def __init__(self, num_classes: int):
+  def __init__(self, in_ch: int = 3, num_classes: int = 10):
     super().__init__()
     self.features = nn.Sequential(
-      nn.Conv2d(3, 32, kernel_size=3, padding=1),
-      nn.ReLU(),
+      nn.Conv2d(in_ch, 32, 3, padding=1),
+      nn.ReLU(inplace=True),
       nn.MaxPool2d(2),
-      nn.Conv2d(32, 64, kernel_size=3, padding=1),
-      nn.ReLU(),
-      nn.MaxPool2d(2),
+      nn.Conv2d(32, 64, 3, padding=1),
+      nn.ReLU(inplace=True),
+      nn.MaxPool2d(2)
     )
-    self.head = nn.Sequential(
+    self.classifier = nn.Sequential(
       nn.Flatten(),
-      nn.Linear(64 * 56 * 56, 256),  # if input was 224x224
-      nn.ReLU(),
-      nn.Linear(256, num_classes),
+      nn.Linear(64 * 8 * 8, 256),  # adjust if your input size differs
+      nn.ReLU(inplace=True),
+      nn.Linear(256, num_classes)
     )
 
-  def forward(self, x):
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
     x = self.features(x)
-    return self.head(x)
+    return self.classifier(x)
 ```
 
-### Transformer encoder (sequence baseline)
+### 4.3 LSTM for padded sequences
 
-Good for tokens or time series. Shape: `x: [B, T, d_model]`.
+`x`: `(N, L)` token ids, `lengths`: `(N,)`
 
 ```python
-# src/models/transformer.py
-import torch
-import torch.nn as nn
-
-class TransformerEncoderModel(nn.Module):
-  def __init__(self, d_in: int, d_model: int, nhead: int, num_layers: int, d_ff: int, out_dim: int, dropout: float = 0.1):
+class LSTMClassifier(nn.Module):
+  def __init__(self, vocab_size: int, emb_dim: int, hidden_dim: int, num_classes: int):
     super().__init__()
-    self.proj = nn.Linear(d_in, d_model)
-    enc_layer = nn.TransformerEncoderLayer(
-      d_model=d_model,
-      nhead=nhead,
-      dim_feedforward=d_ff,
-      dropout=dropout,
-      batch_first=True,
-      activation="gelu",
-      norm_first=True,
-    )
-    self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-    self.head = nn.Linear(d_model, out_dim)
+    self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=0)
+    self.lstm = nn.LSTM(emb_dim, hidden_dim, batch_first=True, bidirectional=True)
+    self.head = nn.Linear(2 * hidden_dim, num_classes)
 
-  def forward(self, x, key_padding_mask=None):
-    # key_padding_mask: [B, T] True for PAD positions
-    h = self.proj(x)
-    h = self.encoder(h, src_key_padding_mask=key_padding_mask)
-    # pool: take CLS-like first token or mean
-    pooled = h.mean(dim=1)
-    return self.head(pooled)
+  def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    e = self.emb(x)  # (N, L, D)
+    packed = nn.utils.rnn.pack_padded_sequence(
+      e, lengths.cpu(), batch_first=True, enforce_sorted=False
+    )
+    _, (h, _) = self.lstm(packed)
+    h = torch.cat([h[-2], h[-1]], dim=1)  # (N, 2H)
+    return self.head(h)
+```
+
+### 4.4 Simple Transformer Encoder (classification)
+
+Good enough for many sequence tasks.
+
+```python
+class TransformerClassifier(nn.Module):
+  def __init__(
+    self,
+    vocab_size: int,
+    d_model: int,
+    nhead: int,
+    num_layers: int,
+    num_classes: int,
+    max_len: int = 512
+  ):
+    super().__init__()
+    self.emb = nn.Embedding(vocab_size, d_model, padding_idx=0)
+    self.pos = nn.Embedding(max_len, d_model)
+    enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+    self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+    self.head = nn.Linear(d_model, num_classes)
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # x: (N, L)
+    N, L = x.shape
+    pos = torch.arange(L, device=x.device).unsqueeze(0).expand(N, L)
+    h = self.emb(x) + self.pos(pos)
+
+    key_padding_mask = (x == 0)  # True where padding
+    h = self.enc(h, src_key_padding_mask=key_padding_mask)
+
+    # mean pool over non-pad
+    mask = (~key_padding_mask).float().unsqueeze(-1)  # (N, L, 1)
+    h = (h * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+    return self.head(h)
+```
+
+### 4.5 Tabular with categorical embeddings (+ numeric)
+
+```python
+class TabularModel(nn.Module):
+  def __init__(
+    self,
+    num_numeric: int,
+    cat_cardinalities: List[int],
+    cat_emb_dim: int = 16,
+    hidden: List[int] = [256, 128],
+    out_dim: int = 1
+  ):
+    super().__init__()
+    self.cat_embs = nn.ModuleList([
+      nn.Embedding(card, cat_emb_dim) for card in cat_cardinalities
+    ])
+    in_dim = num_numeric + cat_emb_dim * len(cat_cardinalities)
+    self.mlp = MLP(in_dim=in_dim, hidden=hidden, out_dim=out_dim, p_drop=0.1)
+
+  def forward(self, x_num: torch.Tensor, x_cat: torch.Tensor) -> torch.Tensor:
+    # x_num: (N, num_numeric)
+    # x_cat: (N, num_cats) with integer codes
+    embs = []
+    for j, emb in enumerate(self.cat_embs):
+      embs.append(emb(x_cat[:, j]))
+    x = torch.cat([x_num] + embs, dim=1)
+    return self.mlp(x)
 ```
 
 ---
 
-## Losses (what to reach for)
+## 5. Losses
 
-### Classification
+### 5.1 Regression
 
-* **Softmax multi-class**: Cross entropy
-  [
-  \mathcal{L} = -\log p_{y}, \quad p=\mathrm{softmax}(z)
-  ]
+```python
+loss_fn = nn.MSELoss()      # L2
+# loss_fn = nn.L1Loss()     # L1
+# loss_fn = nn.HuberLoss(delta=1.0)
+```
+
+### 5.2 Multi-class classification (logits)
+
+* Model outputs raw logits `(N, C)`
+* Targets are class indices `(N,)` with dtype `long`
 
 ```python
 loss_fn = nn.CrossEntropyLoss()
-# logits: [B, C], y: [B] long
 ```
 
-* **Binary / multi-label**: BCE with logits
-  [
-  \mathcal{L} = -y\log \sigma(z) - (1-y)\log(1-\sigma(z))
-  ]
+### 5.3 Binary classification (logits)
+
+* Model outputs logits `(N,)` or `(N, 1)`
+* Targets are floats in `{0,1}`
 
 ```python
 loss_fn = nn.BCEWithLogitsLoss()
-# logits: [B] or [B, C], y: same shape float in {0,1}
 ```
 
-* **Label smoothing** (quick helper)
+### 5.4 Multi-label classification (logits)
+
+* logits `(N, C)`, targets float `(N, C)` in `{0,1}`
 
 ```python
-import torch
-import torch.nn.functional as F
-
-def cross_entropy_label_smoothing(logits, y, eps: float = 0.1):
-  # logits: [B, C], y: [B]
-  n_classes = logits.size(-1)
-  log_probs = F.log_softmax(logits, dim=-1)
-  nll = -log_probs.gather(dim=-1, index=y.unsqueeze(-1)).squeeze(-1)
-  smooth = -log_probs.mean(dim=-1)
-  return ((1 - eps) * nll + eps * smooth).mean()
-```
-
-### Regression
-
-* **MSE**: (\mathcal{L}=|y-\hat y|_2^2)
-
-```python
-loss_fn = nn.MSELoss()
-```
-
-* **Huber / SmoothL1** (robust to outliers):
-
-```python
-loss_fn = nn.SmoothL1Loss(beta=1.0)
-```
-
-### Metric learning (common “bonus” problems)
-
-* **Triplet loss**: enforce (d(a,p)+m < d(a,n))
-
-```python
-loss_fn = nn.TripletMarginLoss(margin=0.2, p=2)
+loss_fn = nn.BCEWithLogitsLoss()
 ```
 
 ---
 
-## Metrics (fast, reliable snippets)
+## 6. Metrics + meters
 
-### Accuracy / Top-k
-
-```python
-import torch
-
-@torch.no_grad()
-def accuracy_topk(logits, y, k: int = 5):
-  # logits: [B, C], y: [B]
-  topk = logits.topk(k, dim=-1).indices  # [B, k]
-  correct = topk.eq(y.unsqueeze(-1)).any(dim=-1).float()
-  return correct.mean()
-```
-
-### F1 (binary, thresholded)
+### 6.1 AverageMeter (the one you actually want)
 
 ```python
-@torch.no_grad()
-def f1_binary_from_logits(logits, y, threshold: float = 0.5, eps: float = 1e-12):
-  # logits, y: [B] (y in {0,1})
-  probs = torch.sigmoid(logits)
-  pred = (probs >= threshold).float()
-  tp = (pred * y).sum()
-  fp = (pred * (1 - y)).sum()
-  fn = ((1 - pred) * y).sum()
-  precision = tp / (tp + fp + eps)
-  recall = tp / (tp + fn + eps)
-  return 2 * precision * recall / (precision + recall + eps)
-```
-
-### RMSE / MAE
-
-```python
-import torch
-
-@torch.no_grad()
-def rmse(pred, y):
-  return torch.sqrt(torch.mean((pred - y) ** 2))
-
-@torch.no_grad()
-def mae(pred, y):
-  return torch.mean(torch.abs(pred - y))
-```
-
-### AUC (use sklearn when allowed)
-
-```python
-# caution: requires moving to CPU
-from sklearn.metrics import roc_auc_score
-
-def auc_from_logits(logits, y):
-  probs = torch.sigmoid(logits).detach().cpu().numpy()
-  y_np = y.detach().cpu().numpy()
-  return roc_auc_score(y_np, probs)
-```
-
----
-
-## Optimizers + schedulers (battle-tested picks)
-
-### AdamW (default)
-
-```python
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-2)
-```
-
-### Cosine schedule with warmup (simple)
-
-```python
-import math
-
-def lr_lambda_cosine_warmup(step, warmup_steps, total_steps):
-  if step < warmup_steps:
-    return (step + 1) / max(1, warmup_steps)
-  progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-  return 0.5 * (1 + math.cos(math.pi * progress))
-
-scheduler = torch.optim.lr_scheduler.LambdaLR(
-  optimizer,
-  lr_lambda=lambda s: lr_lambda_cosine_warmup(s, warmup_steps=500, total_steps=10_000),
-)
-```
-
-### ReduceLROnPlateau (when validation metric stalls)
-
-```python
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-  optimizer, mode="max", factor=0.5, patience=2
-)
-# call scheduler.step(val_metric)
-```
-
----
-
-## Common task recipes
-
-### Multi-class classification: shapes checklist
-
-* Model output: `logits: [B, C]`
-* Target: `y: [B]` with dtype `torch.long`
-* Loss: `nn.CrossEntropyLoss()` (expects raw logits)
-
-### Binary classification: shapes checklist
-
-* Model output: `logits: [B]` (or `[B, 1]` but be consistent)
-* Target: `y: [B]` float in `{0,1}`
-* Loss: `nn.BCEWithLogitsLoss()`
-
-### Regression: shapes checklist
-
-* Model output: `pred: [B, 1]`
-* Target: `y: [B, 1]` float
-* Loss: `MSELoss` or `SmoothL1Loss`
-
----
-
-## Debugging & iteration playbook (do this under pressure)
-
-1. **Overfit a tiny batch**
-
-* Take 1–4 batches, train for 200–1000 steps.
-* If loss won’t drop: bug in data/labels/shapes/loss.
-
-2. **Assert shapes early**
-
-```python
-assert x.ndim == 2, x.shape
-assert y.ndim == 1, y.shape
-assert logits.shape[0] == y.shape[0]
-```
-
-3. **Check label range**
-
-```python
-# for CE
-assert y.min().item() >= 0
-assert y.max().item() < logits.size(-1)
-```
-
-4. **Check for NaNs**
-
-```python
-def has_nan(t):
-  return torch.isnan(t).any().item()
-
-assert not has_nan(x)
-assert not has_nan(loss)
-```
-
-5. **Disable AMP temporarily** if you see instability.
-
----
-
-## Minimal meters for clean logging
-
-```python
-# src/utils/meters.py
 class AverageMeter:
   def __init__(self):
+    self.reset()
+
+  def reset(self):
     self.sum = 0.0
     self.count = 0
 
-  def update(self, value: float, n: int = 1):
-    self.sum += float(value) * n
+  def update(self, val: float, n: int = 1):
+    self.sum += float(val) * n
     self.count += int(n)
 
   @property
   def avg(self) -> float:
-    return self.sum / max(1, self.count)
+    if self.count == 0:
+      return 0.0
+    return self.sum / self.count
 ```
 
----
-
-## “Nice to have” extras (only if time)
-
-### Exponential Moving Average (EMA) of weights (often boosts validation)
+### 6.2 Accuracy (top-1)
 
 ```python
-# src/optim/ema.py
-import copy
-import torch
-
-class EMA:
-  def __init__(self, model, decay: float = 0.999):
-    self.decay = decay
-    self.ema = copy.deepcopy(model).eval()
-    for p in self.ema.parameters():
-      p.requires_grad_(False)
-
-  @torch.no_grad()
-  def update(self, model):
-    msd = model.state_dict()
-    for k, v in self.ema.state_dict().items():
-      if k in msd:
-        v.copy_(v * self.decay + msd[k] * (1 - self.decay))
+@torch.no_grad()
+def accuracy_top1(logits: torch.Tensor, y: torch.Tensor) -> float:
+  pred = logits.argmax(dim=1)
+  return (pred == y).float().mean().item()
 ```
 
-### Gradient accumulation (simulate bigger batches)
+### 6.3 R2 for regression
 
 ```python
-accum_steps = 4
-optimizer.zero_grad(set_to_none=True)
-
-for i, (x, y) in enumerate(loader):
-  with torch.autocast(device_type=device.type, enabled=use_amp):
-    loss = loss_fn(model(x), y) / accum_steps
-  loss.backward()
-
-  if (i + 1) % accum_steps == 0:
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
+@torch.no_grad()
+def r2_score(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+  y_true = y_true.float().view(-1)
+  y_pred = y_pred.float().view(-1)
+  ss_res = torch.sum((y_true - y_pred) ** 2)
+  ss_tot = torch.sum((y_true - y_true.mean()) ** 2).clamp_min(1e-12)
+  return (1.0 - ss_res / ss_tot).item()
 ```
 
 ---
 
-## What to memorize (so you don’t waste time)
+## 7. Optimizers + schedulers
 
-* **CE vs BCEWithLogits**: which target dtype/shape each needs.
-* **Device moves**: always `.to(device)` for tensors and model.
-* **Dataloader speed**: `num_workers`, `pin_memory=True`.
-* **Baseline-first**: start with MLP/CNN/Transformer baseline before fancy ideas.
-* **One metric = one direction**: decide if “higher is better” and stick to it.
-
----
-
-## Quick “choose your baseline” mapping
-
-* **Tabular** → `MLP`, `AdamW`, `CrossEntropyLoss` / `MSELoss`
-* **Images** → `torchvision.models.resnet18` fine-tune (if allowed) or `SmallCNN`
-* **Text / sequences** → `TransformerEncoderModel` + padding mask
-* **Time series regression** → Transformer encoder or 1D CNN + `SmoothL1Loss`
-
----
-
-## Optional: use a pretrained ResNet fast (if allowed)
+### 7.1 Optimizer defaults that won’t embarrass you
 
 ```python
-import torch.nn as nn
-from torchvision.models import resnet18, ResNet18_Weights
+def make_optimizer(model: nn.Module, lr: float, weight_decay: float = 0.0) -> torch.optim.Optimizer:
+  return torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+```
 
-def make_resnet18(num_classes: int):
-  m = resnet18(weights=ResNet18_Weights.DEFAULT)
-  m.fc = nn.Linear(m.fc.in_features, num_classes)
-  return m
+### 7.2 Common schedulers
+
+Step per *epoch*:
+
+```python
+def make_scheduler_epoch(optimizer: torch.optim.Optimizer, max_epochs: int):
+  return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
+```
+
+Step per *iteration* (useful with warmup):
+
+```python
+def make_scheduler_iter(optimizer: torch.optim.Optimizer, total_steps: int, warmup_steps: int = 0):
+  def lr_lambda(step: int):
+    if warmup_steps > 0 and step < warmup_steps:
+      return (step + 1) / warmup_steps
+    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+    return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+  return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 ```
 
 ---
 
-## Tiny test: shape sanity (catches dumb bugs fast)
+## 8. Training loop (AMP, grad clip, accumulation)
+
+This is the block you’ll reuse the most.
+
+### 8.1 One epoch: train
 
 ```python
-# tests/test_shapes.py
-import torch
-from src.models.mlp import MLP
+def train_one_epoch(
+  model: nn.Module,
+  loader: DataLoader,
+  optimizer: torch.optim.Optimizer,
+  loss_fn,
+  device: torch.device,
+  scaler: Optional[torch.cuda.amp.GradScaler] = None,
+  scheduler=None,
+  grad_clip: float = 0.0,
+  accumulate_steps: int = 1
+) -> Dict[str, float]:
+  model.train()
+  loss_meter = AverageMeter()
 
-def test_mlp_shapes():
-  m = MLP(in_dim=10, hidden=[32, 32], out_dim=5)
-  x = torch.randn(7, 10)
-  y = m(x)
-  assert y.shape == (7, 5)
+  optimizer.zero_grad(set_to_none=True)
+
+  for step, batch in enumerate(loader):
+    batch = to_device(batch, device)
+
+    with torch.cuda.amp.autocast(enabled=(scaler is not None)):
+      logits = model(batch["x"]) if "lengths" not in batch else model(batch["x"], batch["lengths"])
+      y = batch["y"]
+      loss = loss_fn(logits, y)
+      loss = loss / accumulate_steps
+
+    if scaler is None:
+      loss.backward()
+      if grad_clip > 0:
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+      if (step + 1) % accumulate_steps == 0:
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+    else:
+      scaler.scale(loss).backward()
+      if (step + 1) % accumulate_steps == 0:
+        if grad_clip > 0:
+          scaler.unscale_(optimizer)
+          nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
+    bs = batch["x"].shape[0]
+    loss_meter.update(loss.item() * accumulate_steps, n=bs)
+
+    if scheduler is not None:
+      # If this scheduler is per-iteration, step here.
+      # If it's per-epoch, step outside this function.
+      if isinstance(scheduler, torch.optim.lr_scheduler.LambdaLR):
+        scheduler.step()
+
+  return {"loss": loss_meter.avg}
 ```
 
-## Final note
+### 8.2 One epoch: eval
 
-This repo is meant to be a **toolbox**: pick the smallest correct baseline, get a clean training loop running, then iterate on features/modeling choices.
+```python
+@torch.no_grad()
+def eval_one_epoch(
+  model: nn.Module,
+  loader: DataLoader,
+  loss_fn,
+  device: torch.device
+) -> Dict[str, float]:
+  model.eval()
+  loss_meter = AverageMeter()
+
+  for batch in loader:
+    batch = to_device(batch, device)
+    logits = model(batch["x"]) if "lengths" not in batch else model(batch["x"], batch["lengths"])
+    y = batch["y"]
+    loss = loss_fn(logits, y)
+    bs = batch["x"].shape[0]
+    loss_meter.update(loss.item(), n=bs)
+
+  return {"loss": loss_meter.avg}
+```
+
+### 8.3 Full fit loop (best checkpoint + scheduler per epoch)
+
+```python
+def fit(
+  model: nn.Module,
+  train_loader: DataLoader,
+  val_loader: DataLoader,
+  optimizer: torch.optim.Optimizer,
+  loss_fn,
+  device: torch.device,
+  epochs: int,
+  scheduler_epoch=None,
+  amp: bool = True,
+  grad_clip: float = 0.0,
+  accumulate_steps: int = 1
+) -> Dict[str, Any]:
+  scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.type == "cuda"))
+  best_val = float("inf")
+  best_state = None
+
+  for epoch in range(1, epochs + 1):
+    t0 = time.time()
+
+    tr = train_one_epoch(
+      model=model,
+      loader=train_loader,
+      optimizer=optimizer,
+      loss_fn=loss_fn,
+      device=device,
+      scaler=scaler if scaler.is_enabled() else None,
+      scheduler=None,
+      grad_clip=grad_clip,
+      accumulate_steps=accumulate_steps
+    )
+
+    va = eval_one_epoch(
+      model=model,
+      loader=val_loader,
+      loss_fn=loss_fn,
+      device=device
+    )
+
+    if scheduler_epoch is not None:
+      scheduler_epoch.step()
+
+    dt = time.time() - t0
+    lr = optimizer.param_groups[0]["lr"]
+    print(f"epoch {epoch:03d} | lr {lr:.3e} | train {tr['loss']:.4f} | val {va['loss']:.4f} | {dt:.1f}s")
+
+    if va["loss"] < best_val:
+      best_val = va["loss"]
+      best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+  if best_state is not None:
+    model.load_state_dict(best_state)
+
+  return {"best_val_loss": best_val}
+```
+
+---
+
+## 9. Evaluation + inference
+
+### 9.1 Batched prediction (no gradients, faster)
+
+```python
+@torch.no_grad()
+def predict(
+  model: nn.Module,
+  loader: DataLoader,
+  device: torch.device
+) -> torch.Tensor:
+  model.eval()
+  preds = []
+
+  with torch.inference_mode():
+    for batch in loader:
+      batch = to_device(batch, device)
+      out = model(batch["x"]) if "lengths" not in batch else model(batch["x"], batch["lengths"])
+      preds.append(out.detach().cpu())
+
+  return torch.cat(preds, dim=0)
+```
+
+---
+
+## 10. Checkpointing + resume
+
+### 10.1 Save / load
+
+Save *everything you need to resume*: model, optimizer, epoch, scaler, and whatever metrics you care about.
+
+```python
+def save_checkpoint(path: str, payload: Dict[str, Any]) -> None:
+  os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+  torch.save(payload, path)
+
+def load_checkpoint(path: str, map_location="cpu") -> Dict[str, Any]:
+  return torch.load(path, map_location=map_location)
+```
+
+### 10.2 Example usage
+
+```python
+# save
+ckpt = {
+  "model": model.state_dict(),
+  "optimizer": optimizer.state_dict(),
+  "epoch": epoch,
+  "best_val_loss": best_val
+}
+save_checkpoint("checkpoints/last.pt", ckpt)
+
+# load
+ckpt = load_checkpoint("checkpoints/last.pt", map_location=device)
+model.load_state_dict(ckpt["model"])
+optimizer.load_state_dict(ckpt["optimizer"])
+start_epoch = ckpt["epoch"] + 1
+```
+
+---
+
+## 11. Early stopping
+
+```python
+class EarlyStopping:
+  def __init__(self, patience: int = 10, min_delta: float = 0.0):
+    self.patience = patience
+    self.min_delta = min_delta
+    self.best = float("inf")
+    self.bad = 0
+
+  def step(self, metric: float) -> bool:
+    # returns True if should stop
+    if metric < self.best - self.min_delta:
+      self.best = metric
+      self.bad = 0
+      return False
+    self.bad += 1
+    return self.bad >= self.patience
+```
+
+Usage inside your fit:
+
+```python
+early = EarlyStopping(patience=5, min_delta=1e-4)
+# after computing val_loss:
+if early.step(val_loss):
+  print("early stopping")
+  break
+```
+
+---
+
+## 12. Debug playbook
+
+These catch 80% of “why is this not learning?” problems.
+
+### 12.1 Overfit one batch
+
+If you can’t drive loss near zero on a tiny batch, your pipeline is broken (shapes, labels, loss, model output).
+
+```python
+def overfit_one_batch(model, batch, loss_fn, device, steps: int = 200, lr: float = 1e-2):
+  model = model.to(device)
+  model.train()
+  opt = torch.optim.AdamW(model.parameters(), lr=lr)
+  batch = to_device(batch, device)
+
+  for i in range(steps):
+    opt.zero_grad(set_to_none=True)
+    out = model(batch["x"]) if "lengths" not in batch else model(batch["x"], batch["lengths"])
+    loss = loss_fn(out, batch["y"])
+    loss.backward()
+    opt.step()
+    if (i + 1) % 20 == 0:
+      print(i + 1, float(loss.item()))
+```
+
+### 12.2 Detect NaNs early
+
+```python
+torch.autograd.set_detect_anomaly(True)
+```
+
+### 12.3 Gradient sanity check
+
+```python
+def grad_norm(model: nn.Module) -> float:
+  total = 0.0
+  for p in model.parameters():
+    if p.grad is None:
+      continue
+    total += p.grad.detach().data.norm(2).item() ** 2
+  return total ** 0.5
+```
+
+---
+
+## 13. Common shape conventions
+
+### Regression
+
+* Model output: `(N,)` or `(N, 1)`
+* Target: same shape, float32
+* Loss: `MSELoss`, `HuberLoss`, etc.
+
+### Multi-class classification
+
+* Model output: logits `(N, C)`
+* Target: class index `(N,)`, dtype `torch.long`
+* Loss: `CrossEntropyLoss` (expects logits, not softmax)
+
+### Binary classification
+
+* Model output: logits `(N,)` or `(N, 1)`
+* Target: `(N,)` float in `{0,1}`
+* Loss: `BCEWithLogitsLoss` (expects logits, not sigmoid)
+
+---
+
+## Minimal end-to-end example (tabular regression)
+
+```python
+seed_everything(42)
+
+# fake data
+N, D = 4096, 20
+X = np.random.randn(N, D).astype(np.float32)
+w = np.random.randn(D).astype(np.float32)
+y = (X @ w + 0.1 * np.random.randn(N)).astype(np.float32)
+
+# split
+idx = np.arange(N)
+np.random.shuffle(idx)
+tr_idx, va_idx = idx[:3000], idx[3000:]
+
+train_ds = NumpyDataset(X[tr_idx], y[tr_idx])
+val_ds = NumpyDataset(X[va_idx], y[va_idx])
+
+train_loader = make_loader(train_ds, batch_size=128, shuffle=True, num_workers=2)
+val_loader = make_loader(val_ds, batch_size=256, shuffle=False, num_workers=2)
+
+device = get_device()
+model = MLP(in_dim=D, hidden=[256, 128], out_dim=1, p_drop=0.1).to(device)
+model = maybe_compile(model, enable=False)
+
+loss_fn = nn.MSELoss()
+optimizer = make_optimizer(model, lr=1e-3, weight_decay=1e-4)
+scheduler = make_scheduler_epoch(optimizer, max_epochs=10)
+
+fit(
+  model=model,
+  train_loader=train_loader,
+  val_loader=val_loader,
+  optimizer=optimizer,
+  loss_fn=loss_fn,
+  device=device,
+  epochs=10,
+  scheduler_epoch=scheduler,
+  amp=True,
+  grad_clip=1.0,
+  accumulate_steps=1
+)
+```
+
+---
+
+## Last blunt notes (read once)
+
+* If metrics don’t move, **overfit one batch**. If that fails, stop training longer — fix the bug.
+* Don’t apply `softmax` before `CrossEntropyLoss`. Don’t apply `sigmoid` before `BCEWithLogitsLoss`.
+* Always call `model.train()` for training and `model.eval()` for eval/inference.
+* Use `optimizer.zero_grad(set_to_none=True)` (less memory traffic, fewer surprises).
+* If you use padding, you must mask it (or pack sequences). Otherwise your model learns garbage.
+
+
