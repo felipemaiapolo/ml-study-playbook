@@ -1,4 +1,3 @@
-```markdown
 # PyTorch Applied ML — Study Repo Cheat Sheet
 
 A practical, copy-pasteable set of **PyTorch patterns** for solving “given a dataset → build a model → train → evaluate → iterate” problems fast.
@@ -737,11 +736,6 @@ def test_mlp_shapes():
   assert y.shape == (7, 5)
 ```
 
----
-
 ## Final note
 
 This repo is meant to be a **toolbox**: pick the smallest correct baseline, get a clean training loop running, then iterate on features/modeling choices.
-
-```
-```
